@@ -1,0 +1,41 @@
+{
+  "version": 1,
+  "author": "Smart Poultry Demo",
+  "editor": "wokwi",
+  "parts": [
+    { "type": "board-esp32-devkit-v1", "id": "esp32", "top": 0, "left": 0, "attrs": {} },
+    { "type": "wokwi-dht22", "id": "dht1", "top": -80, "left": 120, "attrs": { "pin": "4" } },
+    { "type": "wokwi-hc-sr04", "id": "hcsr04", "top": -80, "left": 240, "attrs": { "pin-trig": "5", "pin-echo": "18" } },
+    { "type": "wokwi-resistor", "id": "echo_divider_top", "top": -10, "left": 340, "attrs": { "value": "1k" } },
+    { "type": "wokwi-resistor", "id": "echo_divider_bottom", "top": 40, "left": 340, "attrs": { "value": "1.5k" } },
+    { "type": "wokwi-servo", "id": "servo1", "top": 80, "left": 300, "attrs": { "pin": "13" } },
+    { "type": "wokwi-led", "id": "fan_led", "top": 80, "left": 0, "attrs": { "color": "blue", "label": "FAN" } },
+    { "type": "wokwi-led", "id": "heat_led", "top": 80, "left": 60, "attrs": { "color": "red", "label": "HEAT" } },
+    { "type": "wokwi-resistor", "id": "fan_resistor", "top": 145, "left": 0, "attrs": { "value": "220" } },
+    { "type": "wokwi-resistor", "id": "heat_resistor", "top": 145, "left": 60, "attrs": { "value": "220" } },
+    { "type": "wokwi-buzzer", "id": "buzzer1", "top": 90, "left": 150, "attrs": { "volume": "0.4" } }
+  ],
+  "connections": [
+    [ "esp32:3V3", "dht1:VCC", "red", [] ],
+    [ "esp32:4",  "dht1:SDA",   "green",  [] ],
+    [ "esp32:GND", "dht1:GND", "black", [] ],
+    [ "esp32:VIN", "hcsr04:VCC", "red", [] ],
+    [ "esp32:5",  "hcsr04:TRIG","blue",   [] ],
+    [ "hcsr04:ECHO", "echo_divider_top:1", "yellow", [] ],
+    [ "echo_divider_top:2", "esp32:18", "yellow", [] ],
+    [ "echo_divider_top:2", "echo_divider_bottom:1", "yellow", [] ],
+    [ "echo_divider_bottom:2", "esp32:GND", "black", [] ],
+    [ "esp32:GND", "hcsr04:GND", "black", [] ],
+    [ "esp32:VIN", "servo1:V+", "red", [] ],
+    [ "esp32:13", "servo1:PWM", "orange", [] ],
+    [ "esp32:GND", "servo1:GND", "black", [] ],
+    [ "esp32:19", "fan_resistor:1", "cyan", [] ],
+    [ "fan_resistor:2", "fan_led:A", "cyan", [] ],
+    [ "esp32:21", "heat_resistor:1", "red", [] ],
+    [ "heat_resistor:2", "heat_led:A", "red", [] ],
+    [ "esp32:22", "buzzer1:2", "purple", [] ],
+    [ "esp32:GND", "fan_led:C",  "black", [] ],
+    [ "esp32:GND", "heat_led:C", "black", [] ],
+    [ "esp32:GND", "buzzer1:1", "black", [] ]
+  ]
+}
