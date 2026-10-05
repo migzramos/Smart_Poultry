@@ -37,7 +37,9 @@ static const uint8_t DHT_TYPE = DHT11;
 static const float    DEF_FAN_ON    = 31.0f;
 static const float    DEF_HEAT_ON   = 27.0f;
 static const float    DEF_HYSTER    = 0.5f;
-static const uint8_t  DEF_LOW_PCT   = 15;
+static const uint8_t  DEF_LOW_PCT   = 20;
+static const uint8_t  LEGACY_DEF_LOW_PCT = 15;
+static const float    FEED_WARNING_PCT = 25.0f;
 static const uint32_t DEF_AUTO_MIN  = 240;
 static const float    DEF_DIST_EMPTY= 20.0f;
 static const float    DEF_DIST_FULL = 3.0f;
@@ -48,6 +50,7 @@ static const uint32_t SENSOR_TIMEOUT = 10000;
 static const uint32_t BUZZ_INTERVAL  = 400;
 static const uint32_t ULTRA_SAMPLES  = 5;
 static const uint32_t SERVO_HOLD_MS  = 600;
+static const uint32_t WIFI_SETUP_LOG_INTERVAL = 10000;
 
 // ── Wi-Fi Credentials ──
 static const char* SETUP_AP_SSID = "SmartPoultry_Setup";
@@ -79,6 +82,7 @@ uint8_t  buzzerMode = 0;
 uint32_t t_buzzerTestStart = 0;
 uint32_t t_wifiReconnect   = 0;
 uint32_t t_wifiReboot      = 0;
+uint32_t t_wifiSetupLog    = 0;
 char     serialLine[64] = {};
 uint8_t  serialLineLength = 0;
 bool     serialLineOverflow = false;
@@ -101,23 +105,59 @@ uint32_t t_servoStart = 0;
 enum ServoState { SERVO_IDLE, SERVO_OPEN, SERVO_CLOSE };
 ServoState servoState = SERVO_IDLE;
 
-inline void relaySet(uint8_t pin, bool on) {
+inline uint8_t relayLevel(bool on) {
 #ifdef ENV_HARDWARE
-  digitalWrite(pin, on ? LOW : HIGH);
+  return on ? LOW : HIGH;
 #else
-  digitalWrite(pin, on ? HIGH : LOW);
+  return on ? HIGH : LOW;
 #endif
 }
 
+inline void relaySet(uint8_t pin, bool on) {
+  digitalWrite(pin, relayLevel(on));
+}
+
+void initializeOutputs() {
+  // Set the output latch inactive before enabling output mode to reduce relay glitches.
+  digitalWrite(PIN_FAN, relayLevel(false));
+  digitalWrite(PIN_HEAT, relayLevel(false));
+  digitalWrite(PIN_BUZZER, LOW);
+  pinMode(PIN_FAN, OUTPUT);
+  pinMode(PIN_HEAT, OUTPUT);
+  pinMode(PIN_BUZZER, OUTPUT);
+  relaySet(PIN_FAN, false);
+  relaySet(PIN_HEAT, false);
+  digitalWrite(PIN_BUZZER, LOW);
+  g_fanOn = false;
+  g_heatOn = false;
+  g_buzzerOn = false;
+}
+
 void loadPrefs() {
-  if (!prefs.begin("poultry", true)) return;
-  cfg_fanOn    = prefs.getFloat("fanOn",    DEF_FAN_ON);
-  cfg_heatOn   = prefs.getFloat("heatOn",   DEF_HEAT_ON);
-  cfg_lowPct   = prefs.getUChar("lowPct",   DEF_LOW_PCT);
-  cfg_autoMin  = prefs.getUInt ("autoMin",  DEF_AUTO_MIN);
-  cfg_distEmpty= prefs.getFloat("distEmpty",DEF_DIST_EMPTY);
-  cfg_distFull = prefs.getFloat("distFull", DEF_DIST_FULL);
+  if (!prefs.begin("poultry", true)) {
+    Serial.println("[SETTINGS] ERROR: Could not open settings; using defaults.");
+    return;
+  }
+  cfg_fanOn    = prefs.isKey("fanOn") ? prefs.getFloat("fanOn", DEF_FAN_ON) : DEF_FAN_ON;
+  cfg_heatOn   = prefs.isKey("heatOn") ? prefs.getFloat("heatOn", DEF_HEAT_ON) : DEF_HEAT_ON;
+  cfg_lowPct   = prefs.isKey("lowPct") ? prefs.getUChar("lowPct", DEF_LOW_PCT) : DEF_LOW_PCT;
+  cfg_autoMin  = prefs.isKey("autoMin") ? prefs.getUInt("autoMin", DEF_AUTO_MIN) : DEF_AUTO_MIN;
+  cfg_distEmpty= prefs.isKey("distEmpty") ? prefs.getFloat("distEmpty", DEF_DIST_EMPTY) : DEF_DIST_EMPTY;
+  cfg_distFull = prefs.isKey("distFull") ? prefs.getFloat("distFull", DEF_DIST_FULL) : DEF_DIST_FULL;
   prefs.end();
+
+  if (cfg_lowPct == LEGACY_DEF_LOW_PCT) {
+    cfg_lowPct = DEF_LOW_PCT;
+    if (!prefs.begin("poultry", false)) {
+      Serial.println("[SETTINGS] ERROR: Could not migrate the low-feed buzzer threshold.");
+    } else {
+      bool migrated = prefs.putUChar("lowPct", cfg_lowPct) == sizeof(cfg_lowPct);
+      prefs.end();
+      if (!migrated) {
+        Serial.println("[SETTINGS] ERROR: Could not save the 20% low-feed buzzer threshold.");
+      }
+    }
+  }
 
   if (!isfinite(cfg_fanOn) || cfg_fanOn < -20.0f || cfg_fanOn > 80.0f ||
       !isfinite(cfg_heatOn) || cfg_heatOn < -20.0f || cfg_heatOn > 80.0f ||
@@ -160,7 +200,7 @@ bool startServo() {
 
 float measureDistanceCm(float tempC) {
   if (!isfinite(tempC)) tempC = 25.0f;
-  float total = 0.0f;
+  float distances[ULTRA_SAMPLES] = {};
   uint8_t valid = 0;
   float soundCm = (331.4f + 0.606f * tempC) * 100.0f / 1e6f;
   for (uint8_t i = 0; i < ULTRA_SAMPLES; i++) {
@@ -171,12 +211,26 @@ float measureDistanceCm(float tempC) {
     digitalWrite(PIN_TRIG, LOW);
     long dur = pulseIn(PIN_ECHO, HIGH, 30000UL);
     if (dur > 0) {
-      total += (dur * soundCm) / 2.0f;
-      valid++;
+      float distance = (dur * soundCm) / 2.0f;
+      if (distance >= 2.0f && distance <= 400.0f) {
+        distances[valid++] = distance;
+      }
     }
     delay(10);
   }
-  return (valid > 0) ? (total / valid) : -1.0f;
+  if (valid < 3) return -1.0f;
+
+  for (uint8_t i = 1; i < valid; i++) {
+    float value = distances[i];
+    uint8_t j = i;
+    while (j > 0 && distances[j - 1] > value) {
+      distances[j] = distances[j - 1];
+      j--;
+    }
+    distances[j] = value;
+  }
+  if (valid % 2 != 0) return distances[valid / 2];
+  return (distances[valid / 2 - 1] + distances[valid / 2]) / 2.0f;
 }
 
 float calcFeedPct(float dist) {
@@ -220,6 +274,7 @@ void printStatus() {
   uint32_t now = millis();
   bool temperatureFresh = isfinite(g_temp) && now - t_dhtOkLast < SENSOR_TIMEOUT;
   bool feedFresh = g_feedValid && now - t_feedOkLast < SENSOR_TIMEOUT;
+  bool feedWarning = feedFresh && g_feedPct <= FEED_WARNING_PCT;
   if (temperatureFresh) snprintf(temp, sizeof(temp), "%.1f", g_temp);
   else snprintf(temp, sizeof(temp), "N/A");
   if (temperatureFresh && isfinite(g_hum)) snprintf(humidity, sizeof(humidity), "%.1f", g_hum);
@@ -230,8 +285,9 @@ void printStatus() {
   const char* servoName = "IDLE";
   if (servoState == SERVO_OPEN) servoName = "OPEN";
   else if (servoState == SERVO_CLOSE) servoName = "CLOSE";
-  Serial.printf("[STATUS] Temp: %s C | Hum: %s %% | Feed: %s %% | Fan: %s | Heat: %s | Buzz: %s | Servo: %s\n",
+  Serial.printf("[STATUS] Temp: %s C | Hum: %s %% | Feed: %s %% | Feed warning: %s | Fan command: %s | Heat command: %s | Buzz: %s | Servo command: %s\n",
                 temp, humidity, feed,
+                feedWarning ? "YES" : "NO",
                 g_fanOn ? "ON" : "OFF",
                 g_heatOn ? "ON" : "OFF",
                 g_buzzerOn ? "ON" : "OFF",
@@ -243,7 +299,7 @@ void updateBuzzer(uint32_t now) {
                     now - t_buzzerTestStart < 2000UL;
   if (g_buzzerTestActive && !testActive) g_buzzerTestActive = false;
   bool feedAlarm = g_feedValid && now - t_feedOkLast < SENSOR_TIMEOUT &&
-                   g_feedPct < (float)cfg_lowPct;
+                   g_feedPct <= (float)cfg_lowPct;
   uint8_t requestedMode = testActive ? 2 : (feedAlarm ? 1 : 0);
 
   if (requestedMode != buzzerMode) {
@@ -348,7 +404,8 @@ body{font:16px system-ui;max-width:28rem;margin:3rem auto;padding:1rem;backgroun
 label{display:block;margin-top:1rem}input{box-sizing:border-box;width:100%;padding:.7rem;margin-top:.3rem}
 button{margin-top:1rem;padding:.7rem 1rem;background:#f59e0b;border:0;border-radius:.4rem;font-weight:bold}
 </style><h1>Connect Smart Poultry to Wi-Fi</h1>
-<p>Enter the Wi-Fi network credentials. The device will restart and keep its setup access point if it cannot connect.</p>
+<p>Enter a 2.4 GHz Wi-Fi network. The device will restart and keep its setup access point if it cannot connect.</p>
+<p>Setup page: <a href="http://192.168.4.1/">http://192.168.4.1/</a></p>
 <form method="post" action="/wifi">
 <label>Network name (SSID)<input name="ssid" maxlength="32" required autocomplete="off"></label>
 <label>Wi-Fi password<input name="password" type="password" maxlength="63" autocomplete="new-password"></label>
@@ -391,6 +448,7 @@ void handleApiData() {
   uint32_t now = millis();
   bool temperatureFresh = isfinite(g_temp) && now - t_dhtOkLast < SENSOR_TIMEOUT;
   bool feedFresh = g_feedValid && now - t_feedOkLast < SENSOR_TIMEOUT;
+  bool feedWarning = feedFresh && g_feedPct <= FEED_WARNING_PCT;
   if (temperatureFresh) snprintf(temp, sizeof(temp), "%.1f", g_temp);
   else snprintf(temp, sizeof(temp), "null");
   if (temperatureFresh && isfinite(g_hum)) snprintf(humidity, sizeof(humidity), "%.1f", g_hum);
@@ -398,13 +456,18 @@ void handleApiData() {
   if (feedFresh)
     snprintf(feed, sizeof(feed), "%.0f", g_feedPct);
   else snprintf(feed, sizeof(feed), "null");
-  char buf[160];
+  const char* servoName = "IDLE";
+  if (servoState == SERVO_OPEN) servoName = "OPEN";
+  else if (servoState == SERVO_CLOSE) servoName = "CLOSE";
+  char buf[224];
   snprintf(buf, sizeof(buf),
-    "{\"temp\":%s,\"hum\":%s,\"feed\":%s,\"fan\":%s,\"heat\":%s,\"buzzer\":%s}",
+    "{\"temp\":%s,\"hum\":%s,\"feed\":%s,\"feedWarn\":%s,\"fan\":%s,\"heat\":%s,\"buzzer\":%s,\"servo\":\"%s\"}",
     temp, humidity, feed,
+    feedWarning ? "true" : "false",
     g_fanOn    ? "true" : "false",
     g_heatOn   ? "true" : "false",
-    g_buzzerOn ? "true" : "false"
+    g_buzzerOn ? "true" : "false",
+    servoName
   );
   server.send(200, "application/json", buf);
 }
@@ -517,12 +580,29 @@ void handleWifiConfigPost() {
     server.send(500, "text/plain", "Could not open Wi-Fi settings in flash.");
     return;
   }
+  bool hadSsid = prefs.isKey(WIFI_SSID_KEY);
+  bool hadPassword = prefs.isKey(WIFI_PASS_KEY);
+  String oldSsid = hadSsid ? prefs.getString(WIFI_SSID_KEY, "") : "";
+  String oldPassword = hadPassword ? prefs.getString(WIFI_PASS_KEY, "") : "";
   size_t ssidWritten = prefs.putString(WIFI_SSID_KEY, ssid);
   size_t passwordWritten = prefs.putString(WIFI_PASS_KEY, password);
+  bool saved = ssidWritten == ssid.length() &&
+               passwordWritten == password.length() &&
+               prefs.getString(WIFI_SSID_KEY, "") == ssid &&
+               prefs.getString(WIFI_PASS_KEY, "") == password;
+  bool restored = true;
+  if (!saved) {
+    if (hadSsid) restored = prefs.putString(WIFI_SSID_KEY, oldSsid) == oldSsid.length() && restored;
+    else if (prefs.isKey(WIFI_SSID_KEY)) restored = prefs.remove(WIFI_SSID_KEY) && restored;
+    if (hadPassword)
+      restored = prefs.putString(WIFI_PASS_KEY, oldPassword) == oldPassword.length() && restored;
+    else if (prefs.isKey(WIFI_PASS_KEY)) restored = prefs.remove(WIFI_PASS_KEY) && restored;
+  }
   prefs.end();
-  if (ssidWritten != ssid.length() ||
-      (!password.isEmpty() && passwordWritten != password.length())) {
-    server.send(500, "text/plain", "Could not save Wi-Fi settings to flash.");
+  if (!saved) {
+    Serial.printf("[WIFI] ERROR: Could not verify saved credentials; previous values %s.\n",
+                  restored ? "were restored" : "may not have been fully restored");
+    server.send(500, "text/plain", "Could not verify Wi-Fi settings in flash; previous settings were retained where possible.");
     return;
   }
 
@@ -538,6 +618,7 @@ void handleWifiConfigPost() {
 
 void handleNotFound() {
   if (g_wifiProvisioning) {
+    server.sendHeader("Cache-Control", "no-store");
     server.sendHeader("Location", "http://192.168.4.1/", true);
     server.send(302, "text/plain", "");
   } else {
@@ -548,6 +629,10 @@ void handleNotFound() {
 void setupServer() {
   server.on("/",              HTTP_GET,  handleRoot);
   server.on("/wifi",          HTTP_GET,  handleRoot);
+  server.on("/generate_204",  HTTP_GET,  handleRoot);
+  server.on("/hotspot-detect.html", HTTP_GET, handleRoot);
+  server.on("/connecttest.txt", HTTP_GET, handleRoot);
+  server.on("/ncsi.txt",      HTTP_GET,  handleRoot);
   server.on("/wifi",          HTTP_POST, handleWifiConfigPost);
   server.on("/api/data",      HTTP_GET,  handleApiData);
   server.on("/api/feed",      HTTP_POST, handleApiFeed);
@@ -560,52 +645,103 @@ void setupServer() {
 }
 
 void printStationConnection() {
-  Serial.print("[WIFI] Connected to configured network. Station IP: http://");
+  Serial.print("[WIFI] Connected to configured network. Station IP: ");
   Serial.println(WiFi.localIP());
+  Serial.printf("[WIFI] Open this direct address in your browser: http://%s/\n",
+                WiFi.localIP().toString().c_str());
   if (g_mdnsStarted || MDNS.begin("poultry")) {
     g_mdnsStarted = true;
-    Serial.println("[WIFI] Dashboard: http://poultry.local/");
+    Serial.println("[WIFI] Alternate address (if supported): http://poultry.local/");
   } else {
     Serial.println("[WIFI] ERROR: Could not start mDNS; use the station IP above.");
   }
 }
 
+void logWiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
+  if (event != ARDUINO_EVENT_WIFI_STA_DISCONNECTED) return;
+
+  const char* reason = "other connection failure";
+  switch (info.wifi_sta_disconnected.reason) {
+    case WIFI_REASON_NO_AP_FOUND:
+      reason = "network not found; check the exact name and 2.4 GHz coverage";
+      break;
+    case WIFI_REASON_AUTH_FAIL:
+      reason = "password/authentication rejected; check the home Wi-Fi password";
+      break;
+    case WIFI_REASON_ASSOC_FAIL:
+      reason = "router refused the connection; check router limits and security mode";
+      break;
+    case WIFI_REASON_HANDSHAKE_TIMEOUT:
+      reason = "Wi-Fi security handshake timed out; check password and router security";
+      break;
+    default:
+      break;
+  }
+  Serial.printf("[WIFI] Connection detail: %s (reason %u).\n",
+                reason, (unsigned)info.wifi_sta_disconnected.reason);
+}
+
 bool loadWifiCredentials(String& ssid, String& password) {
-  if (!prefs.begin(WIFI_NAMESPACE, true)) return false;
-  ssid = prefs.getString(WIFI_SSID_KEY, "");
-  password = prefs.getString(WIFI_PASS_KEY, "");
+  if (!prefs.begin(WIFI_NAMESPACE, true)) {
+    Serial.println("[WIFI] ERROR: Could not open saved network credentials.");
+    return false;
+  }
+  ssid = prefs.isKey(WIFI_SSID_KEY) ? prefs.getString(WIFI_SSID_KEY, "") : "";
+  password = prefs.isKey(WIFI_PASS_KEY) ? prefs.getString(WIFI_PASS_KEY, "") : "";
   prefs.end();
+  if (ssid == SETUP_AP_SSID) {
+    Serial.println("[WIFI] ERROR: Setup access point was saved as the router network; clearing invalid credentials.");
+    ssid = "";
+    password = "";
+    g_hasWifiCredentials = false;
+    if (!prefs.begin(WIFI_NAMESPACE, false)) {
+      Serial.println("[WIFI] ERROR: Could not open saved credentials to clear them.");
+      return false;
+    }
+    bool cleared = true;
+    if (prefs.isKey(WIFI_SSID_KEY)) cleared = prefs.remove(WIFI_SSID_KEY) && cleared;
+    if (prefs.isKey(WIFI_PASS_KEY)) cleared = prefs.remove(WIFI_PASS_KEY) && cleared;
+    prefs.end();
+    if (!cleared) {
+      Serial.println("[WIFI] ERROR: Invalid saved network credentials may remain in flash.");
+    }
+    return false;
+  }
   g_hasWifiCredentials = !ssid.isEmpty();
   return g_hasWifiCredentials;
 }
 
+void printSetupInstructions();
+
 void startSetupAccessPoint() {
   if (g_wifiProvisioning) return;
 
-  static const char PASSWORD_CHARS[] = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789";
-  char password[13];
-  for (size_t i = 0; i < sizeof(password) - 1; i++) {
-    password[i] = PASSWORD_CHARS[esp_random() % (sizeof(PASSWORD_CHARS) - 1)];
-  }
-  password[sizeof(password) - 1] = '\0';
-
-  WiFi.mode(WIFI_AP_STA);
-  if (!WiFi.softAP(SETUP_AP_SSID, password)) {
+  WiFi.disconnect(false, false);
+  WiFi.mode(WIFI_AP);
+  if (!WiFi.softAP(SETUP_AP_SSID)) {
     Serial.println("[WIFI] ERROR: Could not start setup access point.");
     return;
   }
   g_wifiProvisioning = true;
+  Serial.printf("[WIFI] Setup access point active on channel %u with IP %s.\n",
+                WiFi.channel(), WiFi.softAPIP().toString().c_str());
   if (!dnsServer.start(53, "*", WiFi.softAPIP())) {
     Serial.println("[WIFI] ERROR: Could not start captive DNS; open http://192.168.4.1/ manually.");
   }
+  t_wifiSetupLog = millis();
+  printSetupInstructions();
+}
+
+void printSetupInstructions() {
   Serial.printf("[WIFI] Setup network: %s\n", SETUP_AP_SSID);
-  Serial.printf("[WIFI] Setup password: %s\n", password);
+  Serial.println("[WIFI] Setup password: none (open network)");
   Serial.print("[WIFI] Setup portal: http://");
   Serial.println(WiFi.softAPIP());
   Serial.println("[WIFI] Enter your local Wi-Fi details on the setup page.");
 }
 
 void setupWiFi() {
+  WiFi.onEvent(logWiFiEvent);
   String ssid;
   String password;
   if (!loadWifiCredentials(ssid, password)) {
@@ -639,6 +775,8 @@ void maintainWiFi(uint32_t now) {
     if (g_wifiProvisioning) {
       dnsServer.stop();
       g_wifiProvisioning = false;
+      WiFi.softAPdisconnect(true);
+      WiFi.mode(WIFI_STA);
       Serial.println("[WIFI] Provisioned station connected; dashboard is now available.");
     }
     printStationConnection();
@@ -647,14 +785,11 @@ void maintainWiFi(uint32_t now) {
     t_wifiReconnect = now;
     Serial.println("[WIFI] Station connection lost.");
   }
-  if (!connected && g_hasWifiCredentials && now - t_wifiReconnect >= 30000UL) {
+  if (!connected && !g_wifiProvisioning && g_hasWifiCredentials &&
+      now - t_wifiReconnect >= 30000UL) {
     t_wifiReconnect = now;
-    Serial.println("[WIFI] Reconnecting to saved network...");
-    WiFi.reconnect();
-    if (!g_wifiProvisioning) {
-      Serial.println("[WIFI] Starting setup access point while reconnecting.");
-      startSetupAccessPoint();
-    }
+    Serial.println("[WIFI] Station remains disconnected; switching to setup access point.");
+    startSetupAccessPoint();
   }
 }
 
@@ -662,18 +797,8 @@ void setup() {
   Serial.begin(115200);
   Serial.println("\n--- SMART POULTRY SYSTEM BOOTING ---");
 
+  initializeOutputs();
   loadPrefs();
-
-  relaySet(PIN_FAN, false);
-  relaySet(PIN_HEAT, false);
-  pinMode(PIN_FAN,    OUTPUT);
-  pinMode(PIN_HEAT,   OUTPUT);
-  relaySet(PIN_FAN, false);
-  relaySet(PIN_HEAT, false);
-  pinMode(PIN_BUZZER, OUTPUT);
-  relaySet(PIN_FAN,  false);
-  relaySet(PIN_HEAT, false);
-  digitalWrite(PIN_BUZZER, LOW);
 
   pinMode(PIN_TRIG, OUTPUT);
   pinMode(PIN_ECHO, INPUT);
@@ -695,7 +820,13 @@ void loop() {
   uint32_t now = millis();
   pollSerialCommands();
   maintainWiFi(now);
-  if (g_wifiProvisioning) dnsServer.processNextRequest();
+  if (g_wifiProvisioning) {
+    dnsServer.processNextRequest();
+    if (now - t_wifiSetupLog >= WIFI_SETUP_LOG_INTERVAL) {
+      t_wifiSetupLog = now;
+      printSetupInstructions();
+    }
+  }
   server.handleClient();
   if (g_wifiRebootPending && now - t_wifiReboot >= 500UL) {
     Serial.flush();

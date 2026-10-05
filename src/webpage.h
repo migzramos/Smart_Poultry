@@ -35,6 +35,7 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
   .feed-bar-bg{background:var(--border);border-radius:999px;height:18px;overflow:hidden;margin:.5rem 0}
   .feed-bar-fill{height:100%;border-radius:999px;background:linear-gradient(90deg,var(--accent),var(--green));transition:width .6s ease}
   .feed-pct{font-size:1.4rem;font-weight:700}
+  .feed-warning{margin-top:.4rem;color:var(--warn-high);font-weight:700}
   .caption{font-size:.72rem;color:var(--muted);margin-top:.25rem}
   button{cursor:pointer;border:none;border-radius:8px;padding:.6rem 1.2rem;font-size:.9rem;font-weight:600;transition:opacity .15s,transform .1s}
   button:active{transform:scale(.97)}
@@ -83,6 +84,7 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
     <h2>Feed Level</h2>
     <div class="feed-pct"><span id="feedPct">--</span> %</div>
     <div class="caption">Estimated from hopper distance</div>
+    <div class="feed-warning" id="feedWarning" role="status" hidden>Low feed: refill soon (25% or less)</div>
     <div class="feed-bar-bg"><div class="feed-bar-fill" id="feedBar" style="width:0%"></div></div>
     <button class="btn-feed" id="feedBtn" onclick="dispenseFeed()">&#9654; Dispense Feed Now</button>
   </div>
@@ -92,6 +94,7 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
     <div id="fanBadge"  class="badge off"><div class="dot"></div>Fan</div>
     <div id="heatBadge" class="badge off"><div class="dot"></div>Heat Lamp</div>
     <div id="buzzBadge" class="badge off"><div class="dot"></div>Buzzer</div>
+    <div id="servoBadge" class="badge off">Servo: IDLE</div>
     <div class="caption">Shows ESP32 commands, not load feedback</div>
     <div style="margin-top:.75rem;font-size:.78rem;color:var(--muted)">
       <span class="status-dot na" id="connDot"></span><span id="connTxt">Connecting...</span>
@@ -106,8 +109,9 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
       <input type="number" id="cfgFan" min="-20" max="80" step="0.5">
       <label>Heat ON below (°C)</label>
       <input type="number" id="cfgHeat" min="-20" max="80" step="0.5">
-      <label>Low Feed Alert (%)</label>
+      <label>Buzzer alarm at/below (%)</label>
       <input type="number" id="cfgLow" min="0" max="100">
+      <div class="caption">Dashboard warning appears at 25%; buzzer default is 20%.</div>
       <label>Auto-feed interval (min, 0=off)</label>
       <input type="number" id="cfgAuto" min="0" max="1440">
       <button class="btn-save" onclick="saveConfig()">&#10003; Save Settings</button>
@@ -159,9 +163,13 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
       const fp = Math.max(0, Math.min(100, isNaN(f)?0:f));
       $('feedPct').textContent = isNaN(f) ? '--' : fp.toFixed(0);
       $('feedBar').style.width = fp + '%';
+      $('feedWarning').hidden = d.feedWarn !== true;
       badge($('fanBadge'),  d.fan,    false);
       badge($('heatBadge'), d.heat,   false);
       badge($('buzzBadge'), d.buzzer, true);
+      const servoState = ['IDLE', 'OPEN', 'CLOSE'].includes(d.servo) ? d.servo : 'N/A';
+      badge($('servoBadge'), servoState !== 'IDLE' && servoState !== 'N/A', false);
+      $('servoBadge').textContent = 'Servo: ' + servoState;
       if(d.buzzer) $('buzzBadge').classList.add('pulsing');
       else         $('buzzBadge').classList.remove('pulsing');
       $('connDot').className='status-dot ok';
@@ -174,6 +182,7 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
       $('humVal').textContent='--';
       $('feedPct').textContent='--';
       $('feedBar').style.width='0%';
+      $('feedWarning').hidden=true;
     });
   }
   // Load current config values into settings form fields.
